@@ -1,6 +1,6 @@
 {
     "name": "tauri-svelte-synced-store",
-    "version": "0.0.1",
+    "version": "0.0.2",
     "license": "AGPL-3.0-only",
     "scripts": {
         "dev": "vite dev",
@@ -21,13 +21,13 @@
     "sideEffects": [
         "**/*.css"
     ],
-    "svelte": "./dist/index.js",
-    "types": "./dist/index.d.ts",
+    "svelte": "./dist/index.svelte.js",
+    "types": "./dist/index.svelte.d.ts",
     "type": "module",
     "exports": {
         ".": {
-            "types": "./dist/index.d.ts",
-            "svelte": "./dist/index.js"
+            "types": "./dist/index.svelte.d.ts",
+            "svelte": "./dist/index.svelte.js"
         }
     },
     "peerDependencies": {
