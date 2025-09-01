@@ -19,7 +19,7 @@ pub struct StateUpdate {
     pub value: String,
 }
 
-// Define a helper trait that combines all the required traits
+// Define an alias trait that combines all the required traits
 pub trait ItemTrait<'r>:
     'static + Send + Sync + Serialize + Deserialize<'r> + Debug + Clone
 {
@@ -30,6 +30,8 @@ impl<'r, T> ItemTrait<'r> for T where
 {
 }
 
+// Item wraps an object and emits an update of the wrapped object when Item is dropped
+// the object is expected to be wrapped in a mutex
 pub struct Item<'r, T: ItemTrait<'r>>(&'r Mutex<T>, &'r str, &'r AppHandle);
 
 impl<'r, T: ItemTrait<'r>> Item<'r, T> {
@@ -82,10 +84,7 @@ impl StateSyncer {
         syncer
     }
 
-    pub fn update_string<'a, T>(&self, key: &str, value: &'a str)
-    where
-        T: 'static + Send + Sync + Serialize + Deserialize<'a> + Debug,
-    {
+    pub fn update_string<'a, T: ItemTrait<'a>>(&self, key: &str, value: &'a str) {
         debug!(key, "update_string");
         let new_value: T = match serde_json::from_str(value) {
             Ok(res) => res,
@@ -98,10 +97,7 @@ impl StateSyncer {
         self.update(key, new_value);
     }
 
-    pub fn update<'a, T>(&self, key: &str, new_value: T)
-    where
-        T: 'static + Send + Sync + Serialize + Deserialize<'a> + Debug,
-    {
+    pub fn update<'a, T: ItemTrait<'a>>(&self, key: &str, new_value: T) {
         debug!(key, "update: {:?}", new_value);
         let mut guard = self.data.lock().unwrap();
         if !guard.contains_key(key) {
@@ -122,19 +118,13 @@ impl StateSyncer {
         *v_guard = new_value;
     }
 
-    pub fn set<'a, T>(&self, key: &str, value: T)
-    where
-        T: 'static + Send + Sync + Serialize + Deserialize<'a>,
-    {
+    pub fn set<'a, T: ItemTrait<'a>>(&self, key: &str, value: T) {
         debug!(key, "set");
         let mut guard = self.data.lock().unwrap();
         guard.insert(key.to_string(), Box::pin(Mutex::new(value)));
     }
 
-    pub fn get<'a, T>(&'a self, key: &'a str) -> Item<'a, T>
-    where
-        T: 'static + Send + Sync + Serialize + Deserialize<'a> + Debug + Clone,
-    {
+    pub fn get<'a, T: ItemTrait<'a>>(&'a self, key: &'a str) -> Item<'a, T> {
         debug!(key, "get");
         let guard = self.data.lock().unwrap();
         let ptr = guard.get(key).unwrap();
@@ -148,10 +138,7 @@ impl StateSyncer {
         Item(v_ref, key, &self.app)
     }
 
-    pub fn emit<'a, T>(&self, name: &str) -> bool
-    where
-        T: 'static + Send + Sync + Serialize + Deserialize<'a> + Clone + Debug + Clone,
-    {
+    pub fn emit<'a, T: ItemTrait<'a>>(&self, name: &str) -> bool {
         debug!(key = name, "emit");
         let guard = self.data.lock().unwrap();
         let ptr = guard.get(name).unwrap();
