@@ -1,3 +1,4 @@
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use specta::Type;
 use std::fmt::Debug;
@@ -20,27 +21,24 @@ pub struct StateUpdate {
 }
 
 // Define an alias trait that combines all the required traits
-pub trait ItemTrait<'r>:
-    'static + Send + Sync + Serialize + Deserialize<'r> + Debug + Clone
-{
-}
+pub trait ItemTrait: 'static + Send + Sync + Serialize + DeserializeOwned + Debug + Clone {}
 // Blanket impl
-impl<'r, T> ItemTrait<'r> for T where
-    T: 'static + Send + Sync + Serialize + Deserialize<'r> + Debug + Clone
+impl<'r, T> ItemTrait for T where
+    T: 'static + Send + Sync + Serialize + DeserializeOwned + Debug + Clone
 {
 }
 
 // Item wraps an object and emits an update of the wrapped object when Item is dropped
 // the object is expected to be wrapped in a mutex
-pub struct Item<'r, T: ItemTrait<'r>>(&'r Mutex<T>, &'r str, &'r AppHandle);
+pub struct Item<'r, T: ItemTrait>(&'r Mutex<T>, &'r str, &'r AppHandle);
 
-impl<'r, T: ItemTrait<'r>> Item<'r, T> {
+impl<'r, T: ItemTrait> Item<'r, T> {
     pub fn lock(&'_ self) -> LockResult<MutexGuard<'_, T>> {
         self.0.lock()
     }
 }
 
-impl<'r, T: ItemTrait<'r>> Drop for Item<'r, T> {
+impl<'r, T: ItemTrait> Drop for Item<'r, T> {
     fn drop(&mut self) {
         let self_guard = self.0.lock().unwrap();
         debug!("[Item] dropped: {:?}", *self_guard);
@@ -52,13 +50,13 @@ impl<'r, T: ItemTrait<'r>> Drop for Item<'r, T> {
     }
 }
 
-impl<'r, T: ItemTrait<'r>> Clone for Item<'r, T> {
+impl<'r, T: ItemTrait> Clone for Item<'r, T> {
     fn clone(&self) -> Self {
         Item(self.0, self.1, self.2)
     }
 }
 
-impl<'r, T: ItemTrait<'r> + PartialEq> PartialEq for Item<'r, T> {
+impl<'r, T: ItemTrait + PartialEq> PartialEq for Item<'r, T> {
     fn eq(&self, other: &Self) -> bool {
         let self_guard = self.0.lock().unwrap();
         let other_guard = other.0.lock().unwrap();
@@ -67,10 +65,13 @@ impl<'r, T: ItemTrait<'r> + PartialEq> PartialEq for Item<'r, T> {
 }
 
 type MapAny = HashMap<String, Pin<Box<dyn Any + Send + Sync>>>;
+type DeserializerMap =
+    HashMap<String, Box<dyn Fn(&str) -> Result<Box<dyn Any + Send>, serde_json::Error> + Send>>;
 
 #[derive(Clone)]
 pub struct StateSyncer {
     data: Arc<Mutex<MapAny>>,
+    deserializers: Arc<Mutex<DeserializerMap>>,
     app: AppHandle,
 }
 
@@ -78,14 +79,15 @@ impl StateSyncer {
     pub fn new(app: AppHandle) -> Self {
         let syncer = StateSyncer {
             data: Default::default(),
+            deserializers: Default::default(),
             app: app.clone(),
         };
 
         syncer
     }
 
-    pub fn update_string<'a, T: ItemTrait<'a>>(&self, key: &str, value: &'a str) {
-        debug!(key, "update_string");
+    pub fn update_typed_string<'a, T: ItemTrait>(&self, key: &str, value: &'a str) {
+        debug!(key, "update_typed_string");
         let new_value: T = match serde_json::from_str(value) {
             Ok(res) => res,
             Err(_) => {
@@ -97,7 +99,7 @@ impl StateSyncer {
         self.update(key, new_value);
     }
 
-    pub fn update<'a, T: ItemTrait<'a>>(&self, key: &str, new_value: T) {
+    pub fn update<'a, T: ItemTrait>(&self, key: &str, new_value: T) {
         debug!(key, "update: {:?}", new_value);
         let mut guard = self.data.lock().unwrap();
         if !guard.contains_key(key) {
@@ -118,13 +120,28 @@ impl StateSyncer {
         *v_guard = new_value;
     }
 
-    pub fn set<'a, T: ItemTrait<'a>>(&self, key: &str, value: T) {
+    pub fn set<'a, T: ItemTrait>(&self, key: &str, value: T) {
         debug!(key, "set");
-        let mut guard = self.data.lock().unwrap();
-        guard.insert(key.to_string(), Box::pin(Mutex::new(value)));
+
+        {
+            let mut ds_guard = self.deserializers.lock().unwrap();
+            if !ds_guard.contains_key(key) {
+                debug!(key, "no deserializer set for this key yet, adding one");
+                let deserializer =
+                    move |s: &str| -> Result<Box<dyn Any + Send>, serde_json::Error> {
+                        let value: T = serde_json::from_str(s)?;
+                        Ok(Box::new(value))
+                    };
+
+                ds_guard.insert(key.to_string(), Box::new(deserializer));
+            }
+        }
+
+        let mut map_guard = self.data.lock().unwrap();
+        map_guard.insert(key.to_string(), Box::pin(Mutex::new(value)));
     }
 
-    pub fn get<'a, T: ItemTrait<'a>>(&'a self, key: &'a str) -> Item<'a, T> {
+    pub fn get<'a, T: ItemTrait>(&'a self, key: &'a str) -> Item<'a, T> {
         debug!(key, "get");
         let guard = self.data.lock().unwrap();
         let ptr = guard.get(key).unwrap();
@@ -138,7 +155,7 @@ impl StateSyncer {
         Item(v_ref, key, &self.app)
     }
 
-    pub fn emit<'a, T: ItemTrait<'a>>(&self, name: &str) -> bool {
+    pub fn emit<'a, T: ItemTrait>(&self, name: &str) -> bool {
         debug!(key = name, "emit");
         let guard = self.data.lock().unwrap();
         let ptr = guard.get(name).unwrap();
