@@ -197,6 +197,7 @@ impl StateSyncer {
             .expect("unable to emit state");
         return true;
     }
+}
 
 #[macro_export]
 macro_rules! state_handlers {
