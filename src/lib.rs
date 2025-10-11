@@ -1,4 +1,4 @@
-use serde::de::DeserializeOwned;
+use serde::de::{DeserializeOwned, Error};
 use serde::{Deserialize, Serialize};
 use specta::Type;
 use std::fmt::Debug;
@@ -64,14 +64,18 @@ impl<'r, T: ItemTrait + PartialEq> PartialEq for Item<'r, T> {
     }
 }
 
+struct Serializers {
+    from_str: Box<dyn Fn(&str) -> Result<Box<dyn Any + Send>, serde_json::Error> + Send>,
+    to_str: Box<dyn Fn(&dyn Any) -> Result<String, serde_json::Error> + Send>,
+}
+
 type MapAny = HashMap<String, Pin<Box<dyn Any + Send + Sync>>>;
-type DeserializerMap =
-    HashMap<String, Box<dyn Fn(&str) -> Result<Box<dyn Any + Send>, serde_json::Error> + Send>>;
+type SerializersMap = HashMap<String, Serializers>;
 
 #[derive(Clone)]
 pub struct StateSyncer {
     data: Arc<Mutex<MapAny>>,
-    deserializers: Arc<Mutex<DeserializerMap>>,
+    serializers: Arc<Mutex<SerializersMap>>,
     app: AppHandle,
 }
 
@@ -79,7 +83,7 @@ impl StateSyncer {
     pub fn new(app: AppHandle) -> Self {
         let syncer = StateSyncer {
             data: Default::default(),
-            deserializers: Default::default(),
+            serializers: Default::default(),
             app: app.clone(),
         };
 
@@ -124,16 +128,32 @@ impl StateSyncer {
         debug!(key, "set");
 
         {
-            let mut ds_guard = self.deserializers.lock().unwrap();
+            let mut ds_guard = self.serializers.lock().unwrap();
             if !ds_guard.contains_key(key) {
-                debug!(key, "no deserializer set for this key yet, adding one");
+                debug!(key, "no serializers set for this key yet, adding it");
                 let deserializer =
                     move |s: &str| -> Result<Box<dyn Any + Send>, serde_json::Error> {
+                        debug!(type = std::any::type_name:: <T>(), "deserializing");
                         let value: T = serde_json::from_str(s)?;
                         Ok(Box::new(value))
                     };
 
-                ds_guard.insert(key.to_string(), Box::new(deserializer));
+                let serializer = move |obj: &dyn Any| {
+                    debug!(real_type = std::any::type_name::<T>(), "serializing");
+
+                    if let Some(concrete) = obj.downcast_ref::<T>() {
+                        serde_json::to_string::<T>(concrete)
+                    } else {
+                        Err(serde_json::Error::custom("Type mismatch"))
+                    }
+                };
+
+                let s = Serializers {
+                    from_str: Box::new(deserializer),
+                    to_str: Box::new(serializer),
+                };
+
+                ds_guard.insert(key.to_string(), s);
             }
         }
 
@@ -177,4 +197,61 @@ impl StateSyncer {
             .expect("unable to emit state");
         return true;
     }
+
+#[macro_export]
+macro_rules! state_handlers {
+    ($($state_type:ident = $state_name:expr),* $(,)?) => {
+        #[tauri::command]
+        #[specta::specta]
+        fn emit_state(name: String, state_syncer: tauri::State<'_, tauri_svelte_synced_store::StateSyncer>) -> bool {
+            tracing::info!("emit_state: {:?}", name);
+
+            match name.as_str() {
+                $(
+                    $state_name => state_syncer.emit::<$state_type>($state_name),
+                )*
+                _ => return false,
+            }
+        }
+
+        #[tauri::command]
+        #[specta::specta]
+        fn update_state(state: tauri_svelte_synced_store::StateUpdate, state_syncer: tauri::State<'_, tauri_svelte_synced_store::StateSyncer>) -> bool {
+            tracing::info!("update_state: {:?}", state);
+
+            match state.name.as_str() {
+                $(
+                    $state_name => {
+                        state_syncer
+                            .update_typed_string::<$state_type>($state_name, state.value.as_str());
+                    }
+                )*
+                _ => {
+                    tracing::warn!("unknown type")
+                }
+            }
+            return true;
+        }
+    };
+}
+
+#[macro_export]
+macro_rules! state_listener {
+    ($app:expr, $syncer:expr, $($state_type:ident = $state_name:expr),* $(,)?) => {
+        StateUpdate::listen(&$app, move |event| {
+            warn!("state update handler: {:?}", event.payload);
+
+            match event.payload.name.as_str() {
+                $(
+                    $state_name => {
+                        $syncer.update_typed_string::<$state_type>(
+                            $state_name,
+                            event.payload.value.as_str(),
+                        );
+                    }
+                )*
+                _ => return,
+            }
+        });
+    };
 }
