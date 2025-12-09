@@ -11,7 +11,7 @@ use std::{
 };
 use tauri::{AppHandle, Emitter};
 use tauri_specta::Event;
-use tracing::{debug, error};
+use tracing::{debug, error, warn};
 
 #[derive(Deserialize, Serialize, Type, Clone, Debug, Event)]
 pub struct StateUpdate {
@@ -105,13 +105,18 @@ impl StateSyncer {
 
     pub fn update<'a, T: ItemTrait>(&self, key: &str, new_value: T) {
         debug!(key, "update: {:?}", new_value);
-        let mut guard = self.data.lock().unwrap();
-        if !guard.contains_key(key) {
-            debug!("key doesn't already exist, inserting instead");
-            guard.insert(key.to_string(), Box::pin(Mutex::new(new_value)));
+        let key_exists: bool;
+        {
+            let guard = self.data.lock().unwrap();
+            key_exists = guard.contains_key(key);
+        }
+        if !key_exists {
+            warn!("updating a key that doesn't exist yet, setting it instead");
+            self.set(key, new_value);
             return;
         }
 
+        let guard = self.data.lock().unwrap();
         let ptr = guard.get(key).unwrap();
         let value = unsafe {
             ptr.downcast_ref::<Mutex<T>>()
@@ -161,6 +166,7 @@ impl StateSyncer {
         map_guard.insert(key.to_string(), Box::pin(Mutex::new(value)));
     }
 
+    // get a mutex protexted item that will emit an update event when dropped
     pub fn get<'a, T: ItemTrait>(&'a self, key: &'a str) -> Item<'a, T> {
         debug!(key, "get");
         let guard = self.data.lock().unwrap();
@@ -175,6 +181,23 @@ impl StateSyncer {
         Item(v_ref, key, &self.app)
     }
 
+    // snapshot an Item in the cache as a read-only reference of the current state
+    pub fn snapshot<'a, T: ItemTrait>(&'a self, key: &'a str) -> T {
+        debug!(key, "get");
+        let guard = self.data.lock().unwrap();
+        let ptr = guard.get(key).unwrap();
+        let value = unsafe {
+            ptr.downcast_ref::<Mutex<T>>()
+                // SAFETY: the type of the key is the same as the type of the value
+                .unwrap_unchecked()
+        };
+        let v_ref = unsafe { &*(value as *const Mutex<T>) };
+        let guard = v_ref.lock().unwrap();
+
+        guard.clone()
+    }
+
+    // emit an update even for the current item's state
     pub fn emit<'a, T: ItemTrait>(&self, name: &str) -> bool {
         debug!(key = name, "emit");
         let guard = self.data.lock().unwrap();
