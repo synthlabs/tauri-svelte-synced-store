@@ -10,8 +10,9 @@ use std::{
     sync::{Arc, Mutex},
 };
 use tauri::{AppHandle, Emitter};
+use tauri_plugin_store::{Store, StoreExt};
 use tauri_specta::Event;
-use tracing::{debug, error, warn};
+use tracing::{debug, error, info, warn};
 
 #[derive(Deserialize, Serialize, Type, Clone, Debug, Event)]
 pub struct StateUpdate {
@@ -30,7 +31,13 @@ impl<'r, T> ItemTrait for T where
 
 // Item wraps an object and emits an update of the wrapped object when Item is dropped
 // the object is expected to be wrapped in a mutex
-pub struct Item<'r, T: ItemTrait>(&'r Mutex<T>, &'r str, &'r AppHandle);
+pub struct Item<'r, T: ItemTrait>(
+    &'r Mutex<T>,               // 0: value
+    &'r str,                    // 1: key
+    &'r AppHandle,              // 2: tauri app ref
+    &'r bool,                   // 3: save_to_disk
+    &'r Arc<Store<tauri::Wry>>, // 4: disk_store
+);
 
 impl<'r, T: ItemTrait> Item<'r, T> {
     pub fn lock(&'_ self) -> LockResult<MutexGuard<'_, T>> {
@@ -47,12 +54,18 @@ impl<'r, T: ItemTrait> Drop for Item<'r, T> {
         self.2
             .emit(&name, self_guard.clone())
             .expect("unable to emit state");
+
+        // if disk persist is enabled
+        if *self.3 {
+            debug!("[Item] persisting to disk: {}", self.1);
+            self.4.set(self.1, serde_json::json!(*self_guard));
+        }
     }
 }
 
 impl<'r, T: ItemTrait> Clone for Item<'r, T> {
     fn clone(&self) -> Self {
-        Item(self.0, self.1, self.2)
+        Item(self.0, self.1, self.2, self.3, self.4)
     }
 }
 
@@ -65,29 +78,94 @@ impl<'r, T: ItemTrait + PartialEq> PartialEq for Item<'r, T> {
 }
 
 struct Serializers {
-    from_str: Box<dyn Fn(&str) -> Result<Box<dyn Any + Send>, serde_json::Error> + Send>,
-    to_str: Box<dyn Fn(&dyn Any) -> Result<String, serde_json::Error> + Send>,
+    _from_str: Box<dyn Fn(&str) -> Result<Box<dyn Any + Send>, serde_json::Error> + Send>,
+    _to_str: Box<dyn Fn(&dyn Any) -> Result<String, serde_json::Error> + Send>,
 }
 
 type MapAny = HashMap<String, Pin<Box<dyn Any + Send + Sync>>>;
 type SerializersMap = HashMap<String, Serializers>;
 
 #[derive(Clone)]
+pub struct StateSyncerConfig {
+    pub sync_to_disk: bool,
+    pub filename: String,
+}
+
+impl Default for StateSyncerConfig {
+    fn default() -> Self {
+        Self {
+            sync_to_disk: false,
+            filename: "state.json".to_owned(),
+        }
+    }
+}
+
+#[derive(Clone)]
 pub struct StateSyncer {
     data: Arc<Mutex<MapAny>>,
     serializers: Arc<Mutex<SerializersMap>>,
     app: AppHandle,
+    cfg: StateSyncerConfig,
+    disk_store: Arc<Store<tauri::Wry>>,
 }
 
 impl StateSyncer {
-    pub fn new(app: AppHandle) -> Self {
+    pub fn new(cfg: StateSyncerConfig, app: AppHandle) -> Self {
         let syncer = StateSyncer {
             data: Default::default(),
             serializers: Default::default(),
             app: app.clone(),
+            cfg: cfg.clone(),
+            disk_store: app.store(cfg.filename).unwrap(),
         };
 
         syncer
+    }
+
+    pub fn load<'a, T: ItemTrait + std::default::Default>(&self, key: &str) -> T {
+        let mut new_value: T = Default::default();
+
+        if !self.cfg.sync_to_disk {
+            warn!(
+                key,
+                "load called with sync_to_disk disabled, returning default"
+            );
+            self.set::<T>(key, new_value.clone());
+            return new_value;
+        }
+
+        debug!(key, "loading from disk");
+        new_value = match self.disk_store.get(key) {
+            Some(val) => match serde_json::from_value(val) {
+                Ok(res) => res,
+                Err(_) => {
+                    error!(key, "value for key did not match specified type");
+                    new_value
+                }
+            },
+            None => {
+                warn!(key, "load called for key not on disk");
+                new_value
+            }
+        };
+
+        self.set::<T>(key, new_value.clone());
+
+        new_value
+    }
+
+    pub fn save<'a, T: ItemTrait>(&self, key: &str) {
+        if !self.cfg.sync_to_disk {
+            error!("save called with sync_to_disk disabled, ignoring");
+            return;
+        }
+        let value = self.snapshot::<T>(key);
+
+        self.persist(key, value);
+    }
+
+    fn persist<'a, T: ItemTrait>(&self, key: &str, value: T) {
+        self.disk_store.set(key, serde_json::json!(value));
     }
 
     pub fn update_typed_string<'a, T: ItemTrait>(&self, key: &str, value: &'a str) {
@@ -111,7 +189,7 @@ impl StateSyncer {
             key_exists = guard.contains_key(key);
         }
         if !key_exists {
-            warn!("updating a key that doesn't exist yet, setting it instead");
+            info!("updating a key that doesn't exist yet, setting it instead");
             self.set(key, new_value);
             return;
         }
@@ -126,11 +204,14 @@ impl StateSyncer {
         let v_ref = unsafe { &*(value as *const Mutex<T>) };
 
         let mut v_guard = v_ref.lock().unwrap();
-        *v_guard = new_value;
+        *v_guard = new_value.clone();
+        if self.cfg.sync_to_disk {
+            self.persist(key, new_value.clone());
+        }
     }
 
     pub fn set<'a, T: ItemTrait>(&self, key: &str, value: T) {
-        debug!(key, "set");
+        debug!(key, "set: {:?}", value);
 
         {
             let mut ds_guard = self.serializers.lock().unwrap();
@@ -154,8 +235,8 @@ impl StateSyncer {
                 };
 
                 let s = Serializers {
-                    from_str: Box::new(deserializer),
-                    to_str: Box::new(serializer),
+                    _from_str: Box::new(deserializer),
+                    _to_str: Box::new(serializer),
                 };
 
                 ds_guard.insert(key.to_string(), s);
@@ -163,7 +244,10 @@ impl StateSyncer {
         }
 
         let mut map_guard = self.data.lock().unwrap();
-        map_guard.insert(key.to_string(), Box::pin(Mutex::new(value)));
+        map_guard.insert(key.to_string(), Box::pin(Mutex::new(value.clone())));
+        if self.cfg.sync_to_disk {
+            self.persist(key, value.clone());
+        }
     }
 
     // get a mutex protexted item that will emit an update event when dropped
@@ -178,7 +262,13 @@ impl StateSyncer {
         };
         let v_ref = unsafe { &*(value as *const Mutex<T>) };
 
-        Item(v_ref, key, &self.app)
+        Item(
+            v_ref,
+            key,
+            &self.app,
+            &self.cfg.sync_to_disk,
+            &self.disk_store,
+        )
     }
 
     // snapshot an Item in the cache as a read-only reference of the current state
