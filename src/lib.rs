@@ -168,7 +168,7 @@ impl StateSyncer {
         self.disk_store.set(key, serde_json::json!(value));
     }
 
-    pub fn update_typed_string<'a, T: ItemTrait>(&self, key: &str, value: &'a str) {
+    pub fn update_typed_string<'a, T: ItemTrait>(&self, key: &str, value: &'a str, emit: bool) {
         debug!(key, "update_typed_string");
         let new_value: T = match serde_json::from_str(value) {
             Ok(res) => res,
@@ -178,10 +178,10 @@ impl StateSyncer {
             }
         };
 
-        self.update(key, new_value);
+        self.update(key, new_value, emit);
     }
 
-    pub fn update<'a, T: ItemTrait>(&self, key: &str, new_value: T) {
+    pub fn update<'a, T: ItemTrait>(&self, key: &str, new_value: T, emit: bool) {
         debug!(key, "update: {:?}", new_value);
         let key_exists: bool;
         {
@@ -205,8 +205,17 @@ impl StateSyncer {
 
         let mut v_guard = v_ref.lock().unwrap();
         *v_guard = new_value.clone();
+
         if self.cfg.sync_to_disk {
             self.persist(key, new_value.clone());
+        }
+
+        if emit {
+            let key = format!("{}_update", key);
+            debug!("emitting {}: {:?}", key, new_value.clone());
+            self.app
+                .emit(key.as_str(), new_value.clone())
+                .expect("unable to emit state");
         }
     }
 
@@ -337,7 +346,7 @@ macro_rules! state_handlers {
                 $(
                     $state_name => {
                         state_syncer
-                            .update_typed_string::<$state_type>($state_name, state.value.as_str());
+                            .update_typed_string::<$state_type>($state_name, state.value.as_str(), true);
                     }
                 )*
                 _ => {
@@ -361,6 +370,7 @@ macro_rules! state_listener {
                         $syncer.update_typed_string::<$state_type>(
                             $state_name,
                             event.payload.value.as_str(),
+                            false,
                         );
                     }
                 )*
