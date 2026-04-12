@@ -87,15 +87,17 @@ type SerializersMap = HashMap<String, Serializers>;
 
 #[derive(Clone)]
 pub struct StateSyncerConfig {
-    pub sync_to_disk: bool,
     pub filename: String,
+    pub persist_keys: HashMap<String, bool>,
+    pub default_persist: bool,
 }
 
 impl Default for StateSyncerConfig {
     fn default() -> Self {
         Self {
-            sync_to_disk: false,
             filename: "state.json".to_owned(),
+            persist_keys: HashMap::new(),
+            default_persist: false,
         }
     }
 }
@@ -125,10 +127,11 @@ impl StateSyncer {
     pub fn load<'a, T: ItemTrait + std::default::Default>(&self, key: &str) -> T {
         let mut new_value: T = Default::default();
 
-        if !self.cfg.sync_to_disk {
+        let persist = self.cfg.persist_keys.get(key).unwrap_or(&self.cfg.default_persist);
+        if !persist {
             warn!(
                 key,
-                "load called with sync_to_disk disabled, returning default"
+                "load called for key not configured to persist, returning default"
             );
             self.set::<T>(key, new_value.clone());
             return new_value;
@@ -155,8 +158,9 @@ impl StateSyncer {
     }
 
     pub fn save<'a, T: ItemTrait>(&self, key: &str) {
-        if !self.cfg.sync_to_disk {
-            error!("save called with sync_to_disk disabled, ignoring");
+        let persist = self.cfg.persist_keys.get(key).unwrap_or(&self.cfg.default_persist);
+        if !persist {
+            error!(key, "save called for key not configured to persist, ignoring");
             return;
         }
         let value = self.snapshot::<T>(key);
@@ -206,7 +210,8 @@ impl StateSyncer {
         let mut v_guard = v_ref.lock().unwrap();
         *v_guard = new_value.clone();
 
-        if self.cfg.sync_to_disk {
+        let persist = self.cfg.persist_keys.get(key).unwrap_or(&self.cfg.default_persist);
+        if *persist {
             self.persist(key, new_value.clone());
         }
 
@@ -254,7 +259,8 @@ impl StateSyncer {
 
         let mut map_guard = self.data.lock().unwrap();
         map_guard.insert(key.to_string(), Box::pin(Mutex::new(value.clone())));
-        if self.cfg.sync_to_disk {
+        let persist = self.cfg.persist_keys.get(key).unwrap_or(&self.cfg.default_persist);
+        if *persist {
             self.persist(key, value.clone());
         }
     }
@@ -271,11 +277,12 @@ impl StateSyncer {
         };
         let v_ref = unsafe { &*(value as *const Mutex<T>) };
 
+        let persist = self.cfg.persist_keys.get(key).unwrap_or(&self.cfg.default_persist);
         Item(
             v_ref,
             key,
             &self.app,
-            &self.cfg.sync_to_disk,
+            persist,
             &self.disk_store,
         )
     }
