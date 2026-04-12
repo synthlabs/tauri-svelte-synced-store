@@ -2,13 +2,23 @@ use serde::de::{DeserializeOwned, Error};
 use serde::{Deserialize, Serialize};
 use specta::Type;
 use std::fmt::Debug;
-use std::sync::{LockResult, MutexGuard};
+use std::sync::{LazyLock, LockResult, MutexGuard};
 use std::{
     any::Any,
     collections::HashMap,
     pin::Pin,
     sync::{Arc, Mutex},
 };
+
+static VERBOSE_LOG: LazyLock<bool> = LazyLock::new(|| std::env::var("RUST_DEBUG").is_ok());
+
+pub fn debug_val<T: Debug>(val: &T) -> String {
+    if *VERBOSE_LOG {
+        format!("{:?}", val)
+    } else {
+        "<...>".to_string()
+    }
+}
 use tauri::{AppHandle, Emitter};
 use tauri_plugin_store::{Store, StoreExt};
 use tauri_specta::Event;
@@ -48,7 +58,7 @@ impl<'r, T: ItemTrait> Item<'r, T> {
 impl<'r, T: ItemTrait> Drop for Item<'r, T> {
     fn drop(&mut self) {
         let self_guard = self.0.lock().unwrap();
-        debug!("[Item] dropped: {:?}", *self_guard);
+        debug!("[Item] dropped: {}", debug_val(&*self_guard));
 
         let name = format!("{}_update", self.1);
         self.2
@@ -186,7 +196,7 @@ impl StateSyncer {
     }
 
     pub fn update<'a, T: ItemTrait>(&self, key: &str, new_value: T, emit: bool) {
-        debug!(key, "update: {:?}", new_value);
+        debug!(key, "update: {}", debug_val(&new_value));
         let key_exists: bool;
         {
             let guard = self.data.lock().unwrap();
@@ -217,7 +227,7 @@ impl StateSyncer {
 
         if emit {
             let key = format!("{}_update", key);
-            debug!("emitting {}: {:?}", key, new_value.clone());
+            debug!("emitting {}: {}", key, debug_val(&new_value));
             self.app
                 .emit(key.as_str(), new_value.clone())
                 .expect("unable to emit state");
@@ -225,7 +235,7 @@ impl StateSyncer {
     }
 
     pub fn set<'a, T: ItemTrait>(&self, key: &str, value: T) {
-        debug!(key, "set: {:?}", value);
+        debug!(key, "set: {}", debug_val(&value));
 
         {
             let mut ds_guard = self.serializers.lock().unwrap();
@@ -320,7 +330,7 @@ impl StateSyncer {
         };
 
         let key = format!("{}_update", name);
-        debug!("emitting {}: {:?}", name, value.clone());
+        debug!("emitting {}: {}", name, debug_val(&*value));
         self.app
             .emit(key.as_str(), value.clone())
             .expect("unable to emit state");
@@ -347,7 +357,7 @@ macro_rules! state_handlers {
         #[tauri::command]
         #[specta::specta]
         fn update_state(state: tauri_svelte_synced_store::StateUpdate, state_syncer: tauri::State<'_, tauri_svelte_synced_store::StateSyncer>) -> bool {
-            tracing::info!("update_state: {:?}", state);
+            tracing::info!("update_state: {}", tauri_svelte_synced_store::debug_val(&state));
 
             match state.name.as_str() {
                 $(
@@ -369,7 +379,7 @@ macro_rules! state_handlers {
 macro_rules! state_listener {
     ($app:expr, $syncer:expr, $($state_type:ident = $state_name:expr),* $(,)?) => {
         StateUpdate::listen(&$app, move |event| {
-            warn!("state update handler: {:?}", event.payload);
+            warn!("state update handler: {}", tauri_svelte_synced_store::debug_val(&event.payload));
 
             match event.payload.name.as_str() {
                 $(
