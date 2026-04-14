@@ -5,19 +5,28 @@ import { invoke } from '@tauri-apps/api/core';
 export class SyncedState<T> {
 	name: string;
 	obj: T = $state({} as T);
+	ready: boolean = $state(false);
+	initialized: Promise<void>;
 	#un_sub: UnlistenFn | undefined;
 
-	constructor(name: string, object: T) {
+	constructor(name: string, object?: T) {
 		this.name = name;
-		this.obj = object;
+		if (object !== undefined) {
+			this.obj = object;
+		}
 
-		// TODO: update this to the type safe event system
-		listen<T>(`${this.name}_update`, (event) => {
-			console.log(`DEBUG [SyncedStore]: ${this.name}_update event`, event.payload);
-			this.obj = event.payload;
-		}).then((f) => {
-			this.#un_sub = f;
-			invoke('emit_state', { name: this.name });
+		this.initialized = new Promise((resolve) => {
+			listen<T>(`${this.name}_update`, (event) => {
+				console.log(`DEBUG [SyncedStore]: ${this.name}_update event`, event.payload);
+				this.obj = event.payload;
+				if (!this.ready) {
+					this.ready = true;
+					resolve();
+				}
+			}).then((f) => {
+				this.#un_sub = f;
+				invoke('emit_state', { name: this.name });
+			});
 		});
 	}
 

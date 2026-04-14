@@ -313,7 +313,7 @@ impl StateSyncer {
         guard.clone()
     }
 
-    // emit an update even for the current item's state
+    // emit an update event for the current item's state
     pub fn emit<'a, T: ItemTrait>(&self, name: &str) -> bool {
         debug!(key = name, "emit");
         let guard = self.data.lock().unwrap();
