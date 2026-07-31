@@ -4,7 +4,7 @@
     "license": "AGPL-3.0-only",
     "scripts": {
         "dev": "vite dev",
-        "build": "vite build && npm run prepack",
+        "build": "vite build && pnpm run prepack",
         "preview": "vite preview",
         "prepare": "svelte-kit sync || echo ''",
         "prepack": "svelte-kit sync && svelte-package && publint",
@@ -57,9 +57,5 @@
     "keywords": [
         "svelte"
     ],
-    "pnpm": {
-        "onlyBuiltDependencies": [
-            "esbuild"
-        ]
-    }
+    "packageManager": "pnpm@11.18.0"
 }
