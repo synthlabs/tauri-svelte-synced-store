@@ -1,86 +1,98 @@
 # tauri-svelte-synced-store
 
-> NOTE: still in early early development
+> NOTE: still in early development
 
-This module is designed to seamlessly keep state synced between the UI (Svelte) and the backend (Tauri). The store allows you to persist and sync string:object pairs. On the Svelte side it exposes the object as a fully typed `$state(T)` object, and on the Rust side it's an `Item<T>` that syncs its state when the item goes out of scope.
+This module keeps typed state synchronized between a Svelte 5 frontend and a Tauri v2 Rust backend over per-subscriber **Tauri Channels**. On the Svelte side it exposes the object as a reactive `$state<T>` object via `SyncedState<T>`, and on the Rust side it provides `StateSyncer` with RAII `Item<T>` guards that publish and persist state when dropped.
 
-## Context
-
-I mostly extracted this from the system I've been using in [Pepo](https://github.com/synthlabs/pepo) and [Scrybe](https://github.com/synthlabs/scrybe) to manage shared state between the rust core and the svelte UI. I wanted to move it to a shared place, to not only keep things consistent between my projects, but also so I can better refine features; as well as share it with other people that may have similar use cases.
-
-Svelte already lends itself incredibly well to modeling the dynamic parts of the UI as a state machine. So when you combine this with a rust backend that can update that state, you end up with a really nice separation of concerns.
-
-## Plans
-
-Right now this is a very rough skeleton as I work through the ergonomics of using it, but some of the things I have in mind that I'd like to support
-
-- No need to manually define the update and emit handlers
-- Support partial updates
-- Support syncing to disk
-- Full type safety (no serialize/deserialize intermediate)
-
-## Example
-
-Here's a rough example of how it's used
+## Setup
 
 ### Rust
 
-Here's how you use it in a Tauri command
+Register the `tauri_svelte_synced_store::plugin` on your `tauri::Builder` (which manages `StateSyncer` and automatically clears subscribers on webview page reloads and window teardown), and expose the sync commands via `state_handlers!()` or `tauri_svelte_synced_store::commands::*`:
+
 ```rust
+use serde::{Deserialize, Serialize};
+use specta::Type;
+use tauri::Manager;
+use tauri_specta::{Builder, collect_commands};
+use tauri_svelte_synced_store::{StateSyncer, StateSyncerConfig, state_handlers};
+
+#[derive(Serialize, Deserialize, Type, Clone, Debug, Default)]
+struct InternalState {
+    authenticated: bool,
+    name: String,
+}
+
+state_handlers!();
+
 #[tauri::command]
 #[specta::specta]
-fn login(name: String, state_syncer: tauri::State<'_, state::Syncer>) -> String {
-    info!(name, "login");
-
+fn login(name: String, state_syncer: tauri::State<'_, StateSyncer>) -> String {
     let internal_state_ref = state_syncer.get::<InternalState>("InternalState");
     let mut internal_state = internal_state_ref.lock().unwrap();
-
     internal_state.authenticated = true;
+    format!("Hello, {name}! You've been greeted from Rust!")
+} // dropping internal_state_ref publishes a snapshot to all subscribed Channels
 
-    format!("Hello, {}! You've been greeted from Rust!", name)
-} // when internal_state_ref goes out of scope its state (and any changes you made) will be synced
+fn main() {
+    let specta_builder = Builder::<tauri::Wry>::new().commands(collect_commands![
+        subscribe_state,
+        unsubscribe_state,
+        update_state,
+        login,
+    ]);
+
+    tauri::Builder::default()
+        .plugin(tauri_plugin_store::Builder::default().build())
+        .plugin(tauri_svelte_synced_store::plugin(StateSyncerConfig::default()))
+        .invoke_handler(specta_builder.invoke_handler())
+        .setup(|app| {
+            let syncer = app.state::<StateSyncer>();
+            syncer.set("InternalState", InternalState::default());
+            Ok(())
+        })
+        .run(tauri::generate_context!())
+        .expect("error while running tauri application");
+}
 ```
 
-### Typescript
+If you need a custom `update_state` handler, omit `state_handlers!()` and register `tauri_svelte_synced_store::commands::subscribe_state` and `tauri_svelte_synced_store::commands::unsubscribe_state` alongside your own `update_state` command.
 
-```ts
+### TypeScript / Svelte 5
+
+```svelte
 <script lang="ts">
-    import { commands } from "$lib/bindings.ts";
-    import { SyncedState } from "$lib/state.svelte";
-    import type { InternalState } from "$lib/bindings.ts";
-    import { onDestroy } from "svelte";
+	import { onDestroy } from 'svelte';
+	import { SyncedState } from 'tauri-svelte-synced-store';
+	import { commands, type InternalState } from '$lib/bindings';
 
-    let internal_state = new SyncedState<InternalState>("InternalState", {
-        authenticated: false,
-        name: "",
-    });
+	const internalState = new SyncedState<InternalState>('InternalState', {
+		authenticated: false,
+		name: ''
+	});
 
-    let greetMsg = $state("");
+	let greetMsg = $state('');
 
-    async function login(event: Event) {
-        event.preventDefault();
-        await internal_state.sync(); // trigger a sync to the backend
-        greetMsg = await commands.login(internal_state.obj.name);
-    }
+	async function login(event: Event) {
+		event.preventDefault();
+		await internalState.sync();
+		greetMsg = await commands.login(internalState.obj.name);
+	}
 
-    onDestroy(() => {
-        internal_state.close();
-    });
+	onDestroy(() => {
+		void internalState.close();
+	});
 </script>
 
 <main class="container">
-    {#if internal_state.obj.authenticated}
-        <h1>Welcome {internal_state.obj.name}</h1>
-    {/if}
+	{#if internalState.obj.authenticated}
+		<h1>Welcome {internalState.obj.name}</h1>
+	{/if}
 
-    <form class="row" onsubmit={login}>
-        <input
-            id="greet-input"
-            placeholder="Enter a name..."
-            bind:value={internal_state.obj.name}
-        />
-        <button type="submit">Greet</button>
-    </form>
-    <p>{greetMsg}</p>
+	<form class="row" onsubmit={login}>
+		<input placeholder="Enter a name..." bind:value={internalState.obj.name} />
+		<button type="submit">Greet</button>
+	</form>
+	<p>{greetMsg}</p>
 </main>
 ```
