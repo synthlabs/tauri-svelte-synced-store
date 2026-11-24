@@ -7,6 +7,29 @@ export interface SyncedStateOptions {
 	conflictPolicy?: ConflictPolicy;
 }
 
+export interface SharedSyncedStateOptions extends SyncedStateOptions {
+	/**
+	 * Optional grace period in milliseconds to keep the underlying channel open
+	 * after the last consumer releases, allowing quick route transitions to reuse it.
+	 * Defaults to `0` (close immediately).
+	 */
+	releaseDelayMs?: number;
+}
+
+export interface SyncedStateHandle<T> {
+	readonly name: string;
+	readonly mode: DeliveryMode;
+	readonly conflictPolicy: ConflictPolicy;
+	obj: T;
+	readonly ready: boolean;
+	readonly revision: number | undefined;
+	readonly initialized: Promise<void>;
+	readonly released: boolean;
+	sync(): Promise<SyncResult>;
+	resync(): Promise<void>;
+	release(): Promise<void>;
+}
+
 export type JsonPatchOp =
 	| { op: 'add'; path: string; value: unknown }
 	| { op: 'remove'; path: string }

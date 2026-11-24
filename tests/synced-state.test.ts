@@ -1,8 +1,12 @@
+import { flushSync } from 'svelte';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import {
 	applyPatchStructural,
+	cloneJson,
 	diffJson,
+	mergePatchInPlace,
 	mergePatchIntoLocal,
+	mergeSnapshotInPlace,
 	mergeSnapshotIntoLocal
 } from '../src/lib/patch.js';
 import type {
@@ -11,6 +15,7 @@ import type {
 	SyncMessage,
 	UpdateOutcome
 } from '../src/lib/protocol.js';
+import { createEffectRoot, trackEffect } from './fixtures/reactivity.svelte.js';
 
 type InvokeCall = {
 	cmd: string;
@@ -128,7 +133,70 @@ describe('patch & merge utilities', () => {
 					policy
 				);
 				expect(fromPatch, `${scenario.name} (${policy})`).toEqual(fromSnapshot);
+
+				const patchTarget = cloneJson(scenario.local);
+				const inPlacePatch = mergePatchInPlace(
+					scenario.oldBase,
+					patchTarget,
+					newBase,
+					patch,
+					policy
+				);
+				expect(
+					{ value: inPlacePatch.value, conflicts: inPlacePatch.conflicts },
+					`in-place patch ${scenario.name} (${policy})`
+				).toEqual(fromSnapshot);
+				expect(inPlacePatch.replacedRoot).toBe(false);
+				expect(inPlacePatch.value).toBe(patchTarget);
+
+				const snapTarget = cloneJson(scenario.local);
+				const inPlaceSnap = mergeSnapshotInPlace(
+					scenario.oldBase,
+					snapTarget,
+					scenario.remote,
+					policy
+				);
+				expect(
+					{ value: inPlaceSnap.value, conflicts: inPlaceSnap.conflicts },
+					`in-place snapshot ${scenario.name} (${policy})`
+				).toEqual(fromSnapshot);
+				expect(inPlaceSnap.replacedRoot).toBe(false);
+				expect(inPlaceSnap.value).toBe(snapTarget);
 			}
+
+			const replaceSnapTarget = cloneJson(scenario.local);
+			const replaceFromSnapshot = mergeSnapshotIntoLocal(
+				scenario.oldBase,
+				scenario.local,
+				scenario.remote,
+				'replace'
+			);
+			const replaceInPlaceSnap = mergeSnapshotInPlace(
+				scenario.oldBase,
+				replaceSnapTarget,
+				scenario.remote,
+				'replace'
+			);
+			expect(
+				{ value: replaceInPlaceSnap.value, conflicts: replaceInPlaceSnap.conflicts },
+				`in-place replace snapshot ${scenario.name}`
+			).toEqual(replaceFromSnapshot);
+			expect(replaceInPlaceSnap.replacedRoot).toBe(false);
+			expect(replaceInPlaceSnap.value).toBe(replaceSnapTarget);
+
+			const replacePatchTarget = cloneJson(scenario.local);
+			const replaceInPlacePatch = mergePatchInPlace(
+				scenario.oldBase,
+				replacePatchTarget,
+				newBase,
+				patch,
+				'replace'
+			);
+			expect(replaceInPlacePatch.value, `in-place replace patch ${scenario.name}`).toEqual(
+				scenario.remote
+			);
+			expect(replaceInPlacePatch.replacedRoot).toBe(false);
+			expect(replaceInPlacePatch.value).toBe(replacePatchTarget);
 		}
 	});
 });
@@ -653,6 +721,23 @@ describe('SyncedState (Tauri Channel delta transport)', () => {
 			return out;
 		}) as typeof JSON.stringify);
 
+		let aRuns = 0;
+		let blobRuns = 0;
+		const stop = createEffectRoot(() => {
+			trackEffect(() => {
+				void state.obj.a;
+				aRuns++;
+			});
+			trackEffect(() => {
+				void state.obj.blob;
+				blobRuns++;
+			});
+		});
+		flushSync();
+		expect(aRuns).toBe(1);
+		expect(blobRuns).toBe(1);
+
+		const objBefore = state.obj;
 		try {
 			// Incoming 1-op delta on 5 MB state
 			ch.emit({
@@ -661,15 +746,21 @@ describe('SyncedState (Tauri Channel delta transport)', () => {
 				revision: 1,
 				patch: [{ op: 'replace', path: '/a', value: 1 }]
 			});
+			flushSync();
+			expect(state.obj).toBe(objBefore);
 			expect(state.obj.a).toBe(1);
 			expect(state.obj.blob.length).toBe(5_000_000);
+			expect(aRuns).toBe(2);
+			expect(blobRuns).toBe(1);
 
 			// Outgoing 1-field sync() on 5 MB state
 			state.obj.b = 2;
 			const res = await state.sync();
 			expect(res).toEqual({ status: 'synced', revision: 2 });
 			expect(largeStringifies).toBe(0);
+			expect(blobRuns).toBe(1);
 		} finally {
+			stop();
 			spy.mockRestore();
 		}
 	});

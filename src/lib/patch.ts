@@ -645,3 +645,321 @@ export function mergePatchIntoLocal<T>(
 
 	return { value: currentLocal as T, conflicts };
 }
+
+export interface InPlaceMergeResult<T> {
+	replacedRoot: boolean;
+	value: T;
+	conflicts: string[];
+}
+
+function assignOrReconcileKey(
+	parent: Record<string, unknown>,
+	key: string,
+	nextVal: unknown
+): void {
+	if (hasDefinedKey(parent, key)) {
+		const curVal = parent[key];
+		if (isPlainObject(curVal) && isPlainObject(nextVal)) {
+			reconcilePlainObjectInPlace(curVal, nextVal);
+			return;
+		}
+		if (jsonEqual(curVal, nextVal)) {
+			return;
+		}
+	}
+	defineJsonProp(parent, key, cloneJson(nextVal));
+}
+
+function reconcilePlainObjectInPlace(
+	target: Record<string, unknown>,
+	next: Record<string, unknown>
+): void {
+	for (const key of Object.keys(target)) {
+		if (!hasDefinedKey(next, key)) {
+			delete target[key];
+		}
+	}
+
+	for (const key of Object.keys(next)) {
+		const nextVal = next[key];
+		if (nextVal === undefined) {
+			continue;
+		}
+		assignOrReconcileKey(target, key, nextVal);
+	}
+}
+
+/**
+ * Reconciles `local` to match `next` in-place when both are plain objects, preserving proxy
+ * identity and skipping writes for equal leaves and arrays.
+ */
+export function reconcileValueInPlace<T>(
+	local: unknown,
+	next: T
+): { replacedRoot: boolean; value: T } {
+	if (isPlainObject(local) && isPlainObject(next)) {
+		reconcilePlainObjectInPlace(local, next);
+		return { replacedRoot: false, value: local as T };
+	}
+	if (jsonEqual(local, next)) {
+		return { replacedRoot: false, value: local as T };
+	}
+	return { replacedRoot: true, value: cloneJson(next) };
+}
+
+function mergePlainObjectsInPlace(
+	oldBase: Record<string, unknown>,
+	local: Record<string, unknown>,
+	remote: Record<string, unknown>,
+	segments: readonly string[],
+	policy: ConflictPolicy,
+	conflicts: string[]
+): void {
+	const keySet = new Set<string>();
+	for (const k of Object.keys(oldBase)) {
+		if (oldBase[k] !== undefined) keySet.add(k);
+	}
+	for (const k of Object.keys(local)) {
+		if (local[k] !== undefined) keySet.add(k);
+	}
+	for (const k of Object.keys(remote)) {
+		if (remote[k] !== undefined) keySet.add(k);
+	}
+
+	const keys = Array.from(keySet).sort(compareStrings);
+
+	for (const key of keys) {
+		const inOld = hasDefinedKey(oldBase, key);
+		const inLocal = hasDefinedKey(local, key);
+		const inRemote = hasDefinedKey(remote, key);
+		const childSegments = [...segments, key];
+
+		if (inOld && inLocal && inRemote) {
+			const oldVal = oldBase[key];
+			const localVal = local[key];
+			const remoteVal = remote[key];
+
+			if (jsonEqual(oldVal, remoteVal)) {
+				if (policy === 'replace') {
+					assignOrReconcileKey(local, key, remoteVal);
+				}
+			} else if (jsonEqual(oldVal, localVal)) {
+				assignOrReconcileKey(local, key, remoteVal);
+			} else if (jsonEqual(localVal, remoteVal)) {
+				// Converged; nothing to mutate.
+			} else if (isPlainObject(oldVal) && isPlainObject(localVal) && isPlainObject(remoteVal)) {
+				mergePlainObjectsInPlace(oldVal, localVal, remoteVal, childSegments, policy, conflicts);
+			} else {
+				conflicts.push(encodePointer(childSegments));
+				if (policy !== 'frontend-wins') {
+					assignOrReconcileKey(local, key, remoteVal);
+				}
+			}
+		} else if (!inOld) {
+			if (inLocal && !inRemote) {
+				if (policy === 'replace') {
+					delete local[key];
+				}
+			} else if (!inLocal && inRemote) {
+				defineJsonProp(local, key, cloneJson(remote[key]));
+			} else if (inLocal && inRemote) {
+				if (!jsonEqual(local[key], remote[key])) {
+					conflicts.push(encodePointer(childSegments));
+					if (policy !== 'frontend-wins') {
+						assignOrReconcileKey(local, key, remote[key]);
+					}
+				}
+			}
+		} else if (!inLocal && !inRemote) {
+			// Both removed; nothing to do.
+		} else if (!inLocal && inRemote) {
+			if (jsonEqual(oldBase[key], remote[key])) {
+				if (policy === 'replace') {
+					defineJsonProp(local, key, cloneJson(remote[key]));
+				}
+			} else {
+				conflicts.push(encodePointer(childSegments));
+				if (policy !== 'frontend-wins') {
+					defineJsonProp(local, key, cloneJson(remote[key]));
+				}
+			}
+		} else if (inLocal && !inRemote) {
+			if (!jsonEqual(oldBase[key], local[key])) {
+				conflicts.push(encodePointer(childSegments));
+				if (policy !== 'frontend-wins') {
+					delete local[key];
+				}
+			} else {
+				delete local[key];
+			}
+		}
+	}
+}
+
+/**
+ * Three-way merges a full remote snapshot into `local` in-place, preserving Svelte 5 `$state`
+ * proxy identity for unchanged subtrees and reporting conflict pointers identically to
+ * `mergeSnapshotIntoLocal`.
+ */
+export function mergeSnapshotInPlace<T>(
+	oldBase: unknown,
+	local: unknown,
+	remote: T,
+	policy: ConflictPolicy
+): InPlaceMergeResult<T> {
+	const conflicts: string[] = [];
+
+	if (jsonEqual(oldBase, remote)) {
+		if (policy === 'replace') {
+			const reconciled = reconcileValueInPlace(local, remote);
+			return { ...reconciled, conflicts };
+		}
+		return { replacedRoot: false, value: local as T, conflicts };
+	}
+	if (jsonEqual(oldBase, local)) {
+		const reconciled = reconcileValueInPlace(local, remote);
+		return { ...reconciled, conflicts };
+	}
+	if (jsonEqual(local, remote)) {
+		return { replacedRoot: false, value: local as T, conflicts };
+	}
+
+	if (isPlainObject(oldBase) && isPlainObject(local) && isPlainObject(remote)) {
+		mergePlainObjectsInPlace(oldBase, local, remote, [], policy, conflicts);
+		return { replacedRoot: false, value: local as T, conflicts };
+	}
+
+	conflicts.push('');
+	if (policy === 'frontend-wins') {
+		return { replacedRoot: false, value: local as T, conflicts };
+	}
+	const reconciled = reconcileValueInPlace(local, remote);
+	return { ...reconciled, conflicts };
+}
+
+function applySlotMergeInPlace(
+	root: Record<string, unknown>,
+	oldSlot: PathSlot,
+	localSlot: PathSlot,
+	newSlot: PathSlot,
+	segments: readonly string[],
+	policy: ConflictPolicy,
+	conflicts: string[]
+): void {
+	const parentSlot = readPath(root, segments.slice(0, -1));
+	if (!parentSlot.exists || !isPlainObject(parentSlot.value)) {
+		return;
+	}
+	const parent = parentSlot.value;
+	const key = segments[segments.length - 1];
+
+	if (slotsEqual(oldSlot, newSlot)) {
+		return;
+	}
+	if (slotsEqual(oldSlot, localSlot)) {
+		if (newSlot.exists) {
+			assignOrReconcileKey(parent, key, newSlot.value);
+		} else if (localSlot.exists) {
+			delete parent[key];
+		}
+		return;
+	}
+	if (slotsEqual(localSlot, newSlot)) {
+		return;
+	}
+
+	if (
+		oldSlot.exists &&
+		localSlot.exists &&
+		newSlot.exists &&
+		isPlainObject(oldSlot.value) &&
+		isPlainObject(localSlot.value) &&
+		isPlainObject(newSlot.value)
+	) {
+		mergePlainObjectsInPlace(
+			oldSlot.value,
+			localSlot.value,
+			newSlot.value,
+			segments,
+			policy,
+			conflicts
+		);
+		return;
+	}
+
+	conflicts.push(encodePointer(segments));
+	if (policy === 'frontend-wins') {
+		return;
+	}
+	if (newSlot.exists) {
+		assignOrReconcileKey(parent, key, newSlot.value);
+	} else if (localSlot.exists) {
+		delete parent[key];
+	}
+}
+
+/**
+ * Three-way merges an incoming delta `patch` (`oldBase -> newBase`) into `local` in-place
+ * in O(patch.length * depth) time without touching unrelated sibling subtrees.
+ */
+export function mergePatchInPlace<T>(
+	oldBase: unknown,
+	local: T,
+	newBase: T,
+	patch: readonly JsonPatchOp[],
+	policy: ConflictPolicy
+): InPlaceMergeResult<T> {
+	if (policy === 'replace') {
+		const reconciled = reconcileValueInPlace(local, newBase);
+		return { ...reconciled, conflicts: [] };
+	}
+	if (patch.length === 0) {
+		return { replacedRoot: false, value: local, conflicts: [] };
+	}
+
+	const sortedPaths = patch.map((op) => parsePointer(op.path)).sort(compareSegmentPaths);
+	const uniquePaths: string[][] = [];
+	for (const segments of sortedPaths) {
+		const prev = uniquePaths[uniquePaths.length - 1];
+		if (!prev || !isPrefixOf(prev, segments)) {
+			uniquePaths.push(segments);
+		}
+	}
+
+	if (uniquePaths.some((segments) => segments.length === 0) || !isPlainObject(local)) {
+		return mergeSnapshotInPlace(oldBase, local, newBase, policy);
+	}
+
+	const conflicts: string[] = [];
+	const handledPrefixes: string[][] = [];
+
+	for (const segments of uniquePaths) {
+		if (handledPrefixes.some((prefix) => isPrefixOf(prefix, segments))) {
+			continue;
+		}
+
+		let ancestorResolved = false;
+		for (let depth = 1; depth < segments.length; depth++) {
+			const prefix = segments.slice(0, depth);
+			const localAnc = readPath(local, prefix);
+			if (!localAnc.exists || !isPlainObject(localAnc.value)) {
+				const oldAnc = readPath(oldBase, prefix);
+				const newAnc = readPath(newBase, prefix);
+				applySlotMergeInPlace(local, oldAnc, localAnc, newAnc, prefix, policy, conflicts);
+				handledPrefixes.push(prefix);
+				ancestorResolved = true;
+				break;
+			}
+		}
+		if (ancestorResolved) {
+			continue;
+		}
+
+		const oldSlot = readPath(oldBase, segments);
+		const localSlot = readPath(local, segments);
+		const newSlot = readPath(newBase, segments);
+		applySlotMergeInPlace(local, oldSlot, localSlot, newSlot, segments, policy, conflicts);
+	}
+
+	return { replacedRoot: false, value: local, conflicts };
+}

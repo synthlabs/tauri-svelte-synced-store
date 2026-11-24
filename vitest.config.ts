@@ -7,6 +7,7 @@ export default defineConfig({
 		conditions: ['browser']
 	},
 	test: {
+		environment: 'happy-dom',
 		include: ['tests/**/*.test.ts']
 	}
 });

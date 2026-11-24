@@ -4,7 +4,7 @@
 
 This module keeps typed state synchronized between a Svelte 5 frontend and a Tauri v2 Rust backend over per-subscriber **Tauri Channels** using revisioned, bidirectional **RFC 6902 JSON Patch deltas** with automatic adaptive fallback to full snapshots.
 
-On the Svelte side it exposes state as a reactive `$state<T>` object via `SyncedState<T>` with non-blocking field-level 3-way merge. On the Rust side it provides `StateSyncer` with monotonic revisions, RAII `Item<T>` guards that publish and persist on drop when serialized state changes, and automatic subscriber cleanup on reload/window teardown.
+On the Svelte side it exposes state as a deeply reactive `$state<T>` proxy updated **in-place** (so unchanged subtrees and sibling fields keep reference identity and don't trigger unrelated `$effect`/`$derived` readers), with non-blocking field-level 3-way merge and shared ref-counted store handles (`useSyncedState` / `acquireSyncedState`). On the Rust side it provides `StateSyncer` with monotonic revisions, RAII `Item<T>` guards that publish and persist on drop when serialized state changes, and automatic subscriber cleanup on reload/window teardown.
 
 ## Setup
 
@@ -75,13 +75,14 @@ let cfg = StateSyncerConfig {
 
 ### TypeScript / Svelte 5
 
+In Svelte components (or `$effect.root()`), prefer `useSyncedState<T>(name, initial?, options?)`. Multiple components using the same store `name` share one backend Tauri Channel subscription and release automatically on unmount:
+
 ```svelte
 <script lang="ts">
-	import { onDestroy } from 'svelte';
-	import { SyncedState } from 'tauri-svelte-synced-store';
+	import { useSyncedState } from 'tauri-svelte-synced-store';
 	import { commands, type InternalState } from '$lib/bindings';
 
-	const internalState = new SyncedState<InternalState>('InternalState', {
+	const internalState = useSyncedState<InternalState>('InternalState', {
 		authenticated: false,
 		name: ''
 	});
@@ -95,10 +96,6 @@ let cfg = StateSyncerConfig {
 			greetMsg = await commands.login(internalState.obj.name);
 		}
 	}
-
-	onDestroy(() => {
-		void internalState.close();
-	});
 </script>
 
 <main class="container">
@@ -114,11 +111,32 @@ let cfg = StateSyncerConfig {
 </main>
 ```
 
+Outside Svelte component / `$effect.root()` lifecycles (e.g. module stores or imperative handlers), use `acquireSyncedState<T>(name, initial?, options?)` and call `await handle.release()` when done:
+
+```ts
+import { acquireSyncedState, closeAllSyncedStates } from 'tauri-svelte-synced-store';
+
+const settings = acquireSyncedState<AppSettings>('app_settings', defaultSettings, {
+	// Optional grace period to keep the channel open across quick route transitions (default: 0)
+	releaseDelayMs: 250
+});
+await settings.initialized;
+// ...
+await settings.release();
+
+// Or tear down all active shared handles explicitly (also runs automatically on `pagehide` / HMR)
+await closeAllSyncedStates();
+```
+
+If you need an isolated, unshared subscription (for example, a modal draft with a different `mode` or `conflictPolicy`), instantiate `new SyncedState<T>(name, initial?, options?)` directly and call `await state.close()` on teardown.
+
 ## Sync Semantics
 
+- **Fine-grained in-place Svelte 5 reactivity**: Incoming snapshots, deltas, `resync()`, canonical normalizations, and stale merges mutate existing Svelte 5 `$state` plain-object proxies in-place rather than replacing `obj` wholesale. Unchanged sibling subtrees and fields preserve object identity (`===`) and do not re-trigger unrelated `$effect`/`$derived` readers; array properties are replaced whole only when their contents change.
+- **Shared ref-counted handles**: `useSyncedState` and `acquireSyncedState` share one `SyncedState<T>` and backend Tauri Channel per `name`. Acquiring an already-open `name` with a conflicting explicit `mode` or `conflictPolicy` throws immediately (omitted/`undefined` options inherit the open config). When the last consumer releases, the subscription closes immediately (or after `releaseDelayMs`), and any remaining handles are cleaned up automatically on `pagehide` or Vite HMR disposal.
 - **Adaptive delta delivery (default)**: Every subscriber receives a revisioned `Snapshot` on subscribe and compact RFC 6902 `Delta` patches (`add` / `remove` / `replace`, with whole-array replacement) whenever the patch is smaller than a full snapshot. Rust proactively falls back to a `Snapshot` if a snapshot is smaller, if a silent mutation (`set` / `update(..., false)`) caused a subscriber's revision to diverge, or if the key/subscriber opted into `mode: 'snapshot'`.
 - **No-op suppression**: Dropping an unmodified `Item<T>` or calling `update(..., true/false)` with an unchanged serialized value does not bump the revision, emit, or persist. Explicit `StateSyncer::emit()` always broadcasts a full `Snapshot`.
-- **Non-blocking conflict policy**: `new SyncedState(name, initial?, { mode, conflictPolicy })` defaults to `mode: 'delta'` and `conflictPolicy: 'backend-wins'` (`'backend-wins' | 'frontend-wins' | 'replace'`). Incoming backend updates preserve non-overlapping local edits and apply `conflictPolicy` on overlapping paths without blocking subsequent `sync()` calls.
+- **Non-blocking conflict policy**: `useSyncedState` / `acquireSyncedState` / `new SyncedState` default to `mode: 'delta'` and `conflictPolicy: 'backend-wins'` (`'backend-wins' | 'frontend-wins' | 'replace'`). Incoming backend updates preserve non-overlapping local edits and apply `conflictPolicy` on overlapping paths without blocking subsequent `sync()` calls.
 - **Optimistic `sync()` results**: `sync()` sends a delta (or full value if smaller / in `'snapshot'` mode) tagged with `baseRevision` and returns a `SyncResult`:
   - `{ status: 'synced', revision }` — committed by Rust.
   - `{ status: 'unchanged', revision }` — no local diff (zero IPC) or no canonical change.
