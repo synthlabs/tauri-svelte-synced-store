@@ -15,12 +15,14 @@ fn main() {
     let macro_builder = Builder::<tauri::Wry>::new().commands(collect_commands![
         subscribe_state,
         unsubscribe_state,
+        snapshot_state,
         update_state,
     ]);
 
     let module_builder = Builder::<tauri::Wry>::new().commands(collect_commands![
         tauri_svelte_synced_store::commands::subscribe_state,
         tauri_svelte_synced_store::commands::unsubscribe_state,
+        tauri_svelte_synced_store::commands::snapshot_state,
         tauri_svelte_synced_store::commands::update_state,
     ]);
 
